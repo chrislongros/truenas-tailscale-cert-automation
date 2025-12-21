@@ -1,0 +1,95 @@
+#!/bin/bash
+set -euo pipefail
+
+# =========================
+# USER CONFIG (REQUIRED)
+# Fill these in with YOUR values.
+# =========================
+
+# 1) Docker container name that runs tailscaled
+CONTAINER_NAME="__TAILSCALE_CONTAINER_NAME__"
+
+# 2) The Tailscale HTTPS hostname you want a cert for (your device's *.ts.net name)
+TS_HOSTNAME="__TAILSCALE_DNS_NAME__"
+
+# 3) Host directory (on TrueNAS) that is bind-mounted into the container at /certs
+#    The container must have:  <HOST_CERT_DIR>  ->  /certs
+HOST_CERT_DIR="__HOST_CERT_DIR__"
+
+# 4) Where to write logs (should be writable by root)
+LOG_FILE="__LOG_FILE__"
+
+# 5) Name to use for the imported TrueNAS certificate entry
+#    Use a stable name to avoid clutter (recommended)
+TRUENAS_CERT_NAME="__TRUENAS_CERT_NAME__"
+
+# =========================
+# END USER CONFIG
+# =========================
+
+CRT="${HOST_CERT_DIR}/ts.crt"
+KEY="${HOST_CERT_DIR}/ts.key"
+
+# Cron-safe PATH
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Log from inside the script (cron output may be discarded)
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+exec >>"$LOG_FILE" 2>&1
+echo "----- $(date -Is) starting tailscale cert import -----"
+
+# Basic dependency checks
+command -v docker >/dev/null || { echo "ERROR: docker not found (PATH=$PATH)"; exit 2; }
+command -v jq >/dev/null || { echo "ERROR: jq not found (PATH=$PATH)"; exit 2; }
+command -v midclt >/dev/null || { echo "ERROR: midclt not found (PATH=$PATH)"; exit 2; }
+
+# Ensure container is running
+if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  echo "ERROR: container '$CONTAINER_NAME' is not running"
+  docker ps --format 'table {{.Names}}\t{{.Status}}'
+  exit 2
+fi
+
+# Ensure /certs exists in container (mount check)
+docker exec "$CONTAINER_NAME" sh -lc 'test -d /certs' || {
+  echo "ERROR: /certs missing inside container. Bind-mount HOST_CERT_DIR -> /certs in the container."
+  exit 2
+}
+
+# Issue/renew cert into /certs (host bind mount)
+# Note: This does NOT print keys; it only prints Tailscale's status lines.
+echo "Requesting/renewing certificate (hostname redacted in this template)..."
+docker exec "$CONTAINER_NAME" sh -lc \
+  "tailscale cert --cert-file /certs/ts.crt --key-file /certs/ts.key \"$TS_HOSTNAME\""
+
+# Verify files exist on host
+if [[ ! -s "$CRT" || ! -s "$KEY" ]]; then
+  echo "ERROR: cert files missing/empty on host directory"
+  ls -l "$HOST_CERT_DIR" || true
+  exit 2
+fi
+
+# Import into TrueNAS cert store
+# We don't trust certificate.create return type; we query by name.
+echo "Importing into TrueNAS certificate store..."
+midclt call certificate.create "$(jq -n \
+  --arg n "$TRUENAS_CERT_NAME" \
+  --rawfile c "$CRT" \
+  --rawfile k "$KEY" \
+  '{name:$n, create_type:"CERTIFICATE_CREATE_IMPORTED", certificate:$c, privatekey:$k}')" >/dev/null || true
+
+CERT_ID="$(midclt call certificate.query | jq -r --arg n "$TRUENAS_CERT_NAME" \
+  '.[] | select(.name==$n) | .id' | tail -n 1)"
+
+if [[ -z "${CERT_ID:-}" || "$CERT_ID" == "null" ]]; then
+  echo "ERROR: could not find imported certificate by name: $TRUENAS_CERT_NAME"
+  exit 2
+fi
+
+# Apply to Web UI and restart UI
+echo "Applying certificate to Web UI and restarting UI..."
+midclt call system.general.update "$(jq -n --argjson id "$CERT_ID" '{ui_certificate:$id, ui_restart_delay: 1}')" >/dev/null
+midclt call system.general.ui_restart >/dev/null
+
+echo "SUCCESS: updated Web UI certificate (cert_name=$TRUENAS_CERT_NAME cert_id=$CERT_ID)"
