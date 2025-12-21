@@ -15,9 +15,7 @@ The script is designed to work reliably with **TrueNAS SCALE cron jobs**, which 
 ## ✨ Features
 
 - Works with **Tailscale running in Docker**
-- No Kubernetes required
 - Cron-safe (handles limited PATH and swallowed output)
-- Does **not rely on fragile return values** from `midclt`
 - Optional internal logging
 - Uses a **stable certificate name** to avoid clutter
 - No hardcoded paths, hostnames, or secrets in the template
