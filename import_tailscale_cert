@@ -19,10 +19,6 @@ HOST_CERT_DIR="__HOST_CERT_DIR__"
 # 4) Where to write logs (should be writable by root)
 LOG_FILE="__LOG_FILE__"
 
-# 5) Name to use for the imported TrueNAS certificate entry
-#    Use a stable name to avoid clutter (recommended)
-TRUENAS_CERT_NAME="__TRUENAS_CERT_NAME__"
-
 # =========================
 # END USER CONFIG
 # =========================
@@ -51,6 +47,10 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   exit 2
 fi
 
+# Ensure cert directory exists with safe permissions
+mkdir -p "$HOST_CERT_DIR"
+chmod 700 "$HOST_CERT_DIR" || true
+
 # Ensure /certs exists in container (mount check)
 docker exec "$CONTAINER_NAME" sh -lc 'test -d /certs' || {
   echo "ERROR: /certs missing inside container. Bind-mount HOST_CERT_DIR -> /certs in the container."
@@ -58,38 +58,53 @@ docker exec "$CONTAINER_NAME" sh -lc 'test -d /certs' || {
 }
 
 # Issue/renew cert into /certs (host bind mount)
-# Note: This does NOT print keys; it only prints Tailscale's status lines.
-echo "Requesting/renewing certificate (hostname redacted in this template)..."
+echo "Using TS_HOSTNAME: $TS_HOSTNAME"
 docker exec "$CONTAINER_NAME" sh -lc \
-  "tailscale cert --cert-file /certs/ts.crt --key-file /certs/ts.key \"$TS_HOSTNAME\""
+  "tailscale cert --cert-file /certs/ts.crt --key-file /certs/ts.key $TS_HOSTNAME"
 
 # Verify files exist on host
 if [[ ! -s "$CRT" || ! -s "$KEY" ]]; then
-  echo "ERROR: cert files missing/empty on host directory"
+  echo "ERROR: cert files missing/empty: $CRT / $KEY"
   ls -l "$HOST_CERT_DIR" || true
   exit 2
 fi
 
+# Use date-based certificate name for easy tracking
+CERT_NAME="tailscale-ui-$(date +%F)"
+echo "Importing certificate as: $CERT_NAME"
+
 # Import into TrueNAS cert store
-# We don't trust certificate.create return type; we query by name.
-echo "Importing into TrueNAS certificate store..."
 midclt call certificate.create "$(jq -n \
-  --arg n "$TRUENAS_CERT_NAME" \
+  --arg n "$CERT_NAME" \
   --rawfile c "$CRT" \
   --rawfile k "$KEY" \
   '{name:$n, create_type:"CERTIFICATE_CREATE_IMPORTED", certificate:$c, privatekey:$k}')" >/dev/null || true
 
-CERT_ID="$(midclt call certificate.query | jq -r --arg n "$TRUENAS_CERT_NAME" \
+CERT_ID="$(midclt call certificate.query | jq -r --arg n "$CERT_NAME" \
   '.[] | select(.name==$n) | .id' | tail -n 1)"
 
 if [[ -z "${CERT_ID:-}" || "$CERT_ID" == "null" ]]; then
-  echo "ERROR: could not find imported certificate by name: $TRUENAS_CERT_NAME"
+  echo "ERROR: could not find imported certificate by name: $CERT_NAME"
   exit 2
 fi
 
-# Apply to Web UI and restart UI
-echo "Applying certificate to Web UI and restarting UI..."
-midclt call system.general.update "$(jq -n --argjson id "$CERT_ID" '{ui_certificate:$id, ui_restart_delay: 1}')" >/dev/null
-midclt call system.general.ui_restart >/dev/null
+echo "Using imported CERT_ID: $CERT_ID"
 
-echo "SUCCESS: updated Web UI certificate (cert_name=$TRUENAS_CERT_NAME cert_id=$CERT_ID)"
+# Apply to Web UI and restart UI
+midclt call system.general.update "$(jq -n --argjson id "$CERT_ID" '{ui_certificate:$id, ui_restart_delay: 1}')"
+midclt call system.general.ui_restart
+
+# Cleanup: remove old tailscale-ui-* certificates (keep only the one just imported)
+OLD_CERTS="$(midclt call certificate.query | jq -r --argjson keep "$CERT_ID" \
+  '[.[] | select(.name | startswith("tailscale-ui-")) | select(.id != $keep) | .id] | .[]')"
+
+if [[ -n "$OLD_CERTS" ]]; then
+  for old_id in $OLD_CERTS; do
+    echo "Deleting old certificate ID: $old_id"
+    midclt call certificate.delete "$old_id" || echo "WARN: failed to delete cert $old_id"
+  done
+else
+  echo "No old tailscale-ui certificates to clean up"
+fi
+
+echo "SUCCESS: applied new UI cert (name=$CERT_NAME id=$CERT_ID)"
