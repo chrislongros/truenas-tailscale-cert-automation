@@ -17,7 +17,8 @@ The script is designed to work reliably with **TrueNAS SCALE cron jobs**, which 
 
 - Works with **Tailscale running in Docker**
 - Cron-safe (handles limited PATH and swallowed output)
-- Internal logging to a configurable file
+- **Detailed internal logging** to a configurable file: every step is timestamped
+  and tagged `INFO`/`WARN`/`ERROR`, with command output indented beneath it
 - **Date-based certificate naming** (`tailscale-ui-YYYY-MM-DD`) for easy tracking
 - **Automatic cleanup** of old `tailscale-ui-*` certificates after each renewal
 - Ensures cert directory exists with secure permissions (`700`)
@@ -65,6 +66,60 @@ which is removed in TrueNAS 26. `certificate.create`
 5. Sets it as the Web UI certificate
 6. Restarts the Web UI
 7. Deletes any previous `tailscale-ui-*` certificates to keep the store clean
+
+---
+
+## Logging
+
+Everything the script does is written to `LOG_FILE`, one timestamped line per
+step, so a failed cron run can be diagnosed from the log alone:
+
+```
+2026-08-27T19:36:13+02:00 [INFO ] ===== tailscale cert import starting =====
+2026-08-27T19:36:13+02:00 [INFO ] truenas version: TrueNAS-SCALE-25.10.6
+2026-08-27T19:36:13+02:00 [INFO ] api client: truenas_api_client via /usr/bin/python3 (Python 3.11.2)
+2026-08-27T19:36:13+02:00 [INFO ] container 'ts-container' is running
+         | tailscale/tailscale:latest  Up 3 weeks (healthy)
+2026-08-27T19:36:13+02:00 [INFO ] cert files on host: ts.crt=2010 bytes, ts.key=1704 bytes
+2026-08-27T19:36:13+02:00 [INFO ] cert expires: Nov 25 17:36:13 2026 GMT
+2026-08-27T19:36:13+02:00 [INFO ] certificate.query returned 0 match(es)
+2026-08-27T19:36:13+02:00 [INFO ] certificate.create finished, new certificate id=42
+         | id=9  tailscale-ui-2026-05-01  <- deleting
+2026-08-27T19:36:13+02:00 [INFO ] SUCCESS: web UI cert is name=tailscale-ui-2026-08-27 id=42 (created), expires Nov 25 17:36:13 2026 GMT
+2026-08-27T19:36:13+02:00 [INFO ] ===== run finished rc=0 duration=1s =====
+```
+
+What gets recorded:
+
+- Identity of the run: script path, PID, user, host, resolved config, `PATH`
+- Preflight: resolved path and version of every dependency, the detected TrueNAS
+  version, and which Python interpreter and API client module were selected
+- Container state, the image/status line, and the `/certs` mount check
+- The exact `tailscale cert` command, its output, and the resulting file sizes
+- Certificate subject, expiry and SHA-256 fingerprint, plus a note when the
+  fingerprint is unchanged from the previous run (Tailscale did not reissue)
+- Each API call, whether the certificate was **created or reused**, and the ID
+- Every certificate considered for cleanup, marked `<- keeping` or `<- deleting`
+- On failure: the error, the exit code and the **line number** that aborted
+- A closing line with the exit code and total duration
+
+Run by hand and output is echoed to your terminal as well as the log file:
+
+```bash
+/path/to/import_tailscale_cert
+```
+
+Set `DEBUG=1` to add a full `set -x` trace, timestamped and line-numbered:
+
+```bash
+DEBUG=1 /path/to/import_tailscale_cert
+```
+
+To watch a cron run live:
+
+```bash
+tail -f /path/to/cert-import.log
+```
 
 ---
 
