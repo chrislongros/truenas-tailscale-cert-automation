@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # =========================
 # USER CONFIG (REQUIRED)
@@ -32,79 +32,303 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Log from inside the script (cron output may be discarded)
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
-exec >>"$LOG_FILE" 2>&1
-echo "----- $(date -Is) starting tailscale cert import -----"
+if [[ -t 1 ]]; then
+  # Run by hand: show progress on the terminal and still write the log file.
+  exec > >(tee -a "$LOG_FILE") 2>&1
+else
+  exec >>"$LOG_FILE" 2>&1
+fi
 
-# Basic dependency checks
-command -v docker >/dev/null || { echo "ERROR: docker not found (PATH=$PATH)"; exit 2; }
-command -v jq >/dev/null || { echo "ERROR: jq not found (PATH=$PATH)"; exit 2; }
-command -v midclt >/dev/null || { echo "ERROR: midclt not found (PATH=$PATH)"; exit 2; }
+# ---------- logging helpers ----------
+# Every line is timestamped and tagged, so one log file can hold months of cron
+# runs and still be readable with grep.
+log()  { printf '%s [INFO ] %s\n' "$(date -Is)" "$*"; }
+warn() { printf '%s [WARN ] %s\n' "$(date -Is)" "$*"; }
+err()  { printf '%s [ERROR] %s\n' "$(date -Is)" "$*"; }
 
-# Ensure container is running
-if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-  echo "ERROR: container '$CONTAINER_NAME' is not running"
-  docker ps --format 'table {{.Names}}\t{{.Status}}'
+# Indent captured command output so it is clearly subordinate to its log line.
+log_block() {
+  if [[ -n "${1:-}" ]]; then
+    printf '%s\n' "$1" | sed 's/^/         | /'
+  fi
+}
+
+# DEBUG=1 traces every command the script runs.
+if [[ "${DEBUG:-0}" == "1" ]]; then
+  export PS4='+ $(date -Is) ${BASH_SOURCE##*/}:${LINENO}: '
+  set -x
+fi
+
+# Report where and why we stopped, even when set -e aborts mid-script.
+FAILED_LINE=""
+trap 'FAILED_LINE=$LINENO' ERR
+finish() {
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    err "run FAILED rc=$rc${FAILED_LINE:+ at line $FAILED_LINE}"
+  fi
+  log "===== run finished rc=$rc duration=${SECONDS}s ====="
+}
+trap finish EXIT
+
+log "===== tailscale cert import starting ====="
+log "script:    $0 (pid $$)"
+log "user:      $(id -un 2>/dev/null || echo unknown) (uid $(id -u))"
+log "host:      $(hostname 2>/dev/null || echo unknown)"
+log "container: $CONTAINER_NAME"
+log "ts name:   $TS_HOSTNAME"
+log "cert dir:  $HOST_CERT_DIR (crt=$CRT key=$KEY)"
+log "log file:  $LOG_FILE"
+log "PATH:      $PATH"
+
+# ---------- preflight ----------
+log "--- preflight checks ---"
+for dep in docker jq midclt; do
+  if dep_path="$(command -v "$dep")"; then
+    log "found $dep -> $dep_path"
+  else
+    err "$dep not found (PATH=$PATH)"
+    exit 2
+  fi
+done
+log "docker version: $(docker --version 2>&1 | head -1 || echo unknown)"
+log "jq version:     $(jq --version 2>&1 | head -1 || echo unknown)"
+
+if tn_version="$(midclt call system.version 2>&1)"; then
+  log "truenas version: $tn_version"
+else
+  warn "could not query system.version: $tn_version"
+fi
+
+# Pick a python3 that can import the TrueNAS API client. The client ships
+# preinstalled on TrueNAS and provides midclt itself, so midclt's own
+# interpreter is the fallback if the default python3 cannot import it.
+PY_BIN=""
+PY_CLIENT=""
+for candidate in python3 "$(sed -n '1s|^#!\([^ ]*\).*|\1|p' "$(command -v midclt)" 2>/dev/null)"; do
+  [[ -n "$candidate" ]] || continue
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if "$candidate" -c 'import truenas_api_client' 2>/dev/null; then
+    PY_BIN="$candidate"; PY_CLIENT="truenas_api_client"; break
+  elif "$candidate" -c 'import middlewared.client' 2>/dev/null; then
+    PY_BIN="$candidate"; PY_CLIENT="middlewared.client"; break
+  else
+    log "candidate '$candidate' cannot import the TrueNAS API client, skipping"
+  fi
+done
+if [[ -z "$PY_BIN" ]]; then
+  err "no python3 found that can import the TrueNAS API client"
+  err "  (tried 'truenas_api_client' and 'middlewared.client')"
+  err "  check that 'midclt call system.info' works on this host"
+  exit 2
+fi
+log "api client: $PY_CLIENT via $(command -v "$PY_BIN") ($("$PY_BIN" -V 2>&1 || echo unknown))"
+
+# ---------- container checks ----------
+log "--- container checks ---"
+if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  log "container '$CONTAINER_NAME' is running"
+  log_block "$(docker ps --filter "name=^${CONTAINER_NAME}\$" --format '{{.Image}}  {{.Status}}' 2>&1 || true)"
+else
+  err "container '$CONTAINER_NAME' is not running"
+  log_block "$(docker ps --format 'table {{.Names}}\t{{.Status}}' 2>&1 || true)"
   exit 2
 fi
 
 # Ensure cert directory exists with safe permissions
 mkdir -p "$HOST_CERT_DIR"
-chmod 700 "$HOST_CERT_DIR" || true
+chmod 700 "$HOST_CERT_DIR" || warn "could not chmod 700 $HOST_CERT_DIR"
+log "cert dir perms: $(ls -ld "$HOST_CERT_DIR" 2>&1 || echo unknown)"
 
 # Ensure /certs exists in container (mount check)
-docker exec "$CONTAINER_NAME" sh -lc 'test -d /certs' || {
-  echo "ERROR: /certs missing inside container. Bind-mount HOST_CERT_DIR -> /certs in the container."
+if docker exec "$CONTAINER_NAME" sh -lc 'test -d /certs'; then
+  log "/certs is present inside the container"
+else
+  err "/certs missing inside container. Bind-mount HOST_CERT_DIR -> /certs in the container."
   exit 2
-}
+fi
 
-# Issue/renew cert into /certs (host bind mount)
-echo "Using TS_HOSTNAME: $TS_HOSTNAME"
-docker exec "$CONTAINER_NAME" sh -lc \
-  "tailscale cert --cert-file /certs/ts.crt --key-file /certs/ts.key $TS_HOSTNAME"
+# ---------- issue/renew the certificate ----------
+log "--- issuing/renewing certificate ---"
+PREV_FP=""
+if [[ -s "$CRT" ]] && command -v openssl >/dev/null 2>&1; then
+  PREV_FP="$(openssl x509 -in "$CRT" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//' || true)"
+  log "previous cert fingerprint: ${PREV_FP:-unknown}"
+fi
+
+TS_CMD="tailscale cert --cert-file /certs/ts.crt --key-file /certs/ts.key $TS_HOSTNAME"
+log "running in container: $TS_CMD"
+if ts_out="$(docker exec "$CONTAINER_NAME" sh -lc "$TS_CMD" 2>&1)"; then
+  log "tailscale cert completed"
+  log_block "$ts_out"
+else
+  err "tailscale cert failed (rc=$?)"
+  log_block "$ts_out"
+  exit 2
+fi
 
 # Verify files exist on host
 if [[ ! -s "$CRT" || ! -s "$KEY" ]]; then
-  echo "ERROR: cert files missing/empty: $CRT / $KEY"
-  ls -l "$HOST_CERT_DIR" || true
+  err "cert files missing/empty: $CRT / $KEY"
+  log_block "$(ls -l "$HOST_CERT_DIR" 2>&1 || true)"
   exit 2
 fi
 
+CRT_BYTES="$(wc -c <"$CRT" | tr -d ' ')"
+KEY_BYTES="$(wc -c <"$KEY" | tr -d ' ')"
+log "cert files on host: ts.crt=${CRT_BYTES} bytes, ts.key=${KEY_BYTES} bytes"
+log "import payload is $((CRT_BYTES + KEY_BYTES)) bytes; sent over the middleware socket, not as an argv entry"
+
+if command -v openssl >/dev/null 2>&1; then
+  log "cert subject: $(openssl x509 -in "$CRT" -noout -subject 2>/dev/null | sed 's/^subject= *//' || echo unknown)"
+  log "cert expires: $(openssl x509 -in "$CRT" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || echo unknown)"
+  NEW_FP="$(openssl x509 -in "$CRT" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//' || true)"
+  log "cert fingerprint: ${NEW_FP:-unknown}"
+  if [[ -n "$PREV_FP" && "$PREV_FP" == "$NEW_FP" ]]; then
+    log "fingerprint unchanged: tailscale reused the existing certificate rather than reissuing"
+  fi
+fi
+
+# ---------- import into the TrueNAS cert store ----------
 # Use date-based certificate name for easy tracking
 CERT_NAME="tailscale-ui-$(date +%F)"
-echo "Importing certificate as: $CERT_NAME"
+log "--- importing into the TrueNAS certificate store ---"
+log "certificate name: $CERT_NAME"
 
-# Import into TrueNAS cert store
-midclt call certificate.create "$(jq -n \
-  --arg n "$CERT_NAME" \
-  --rawfile c "$CRT" \
-  --rawfile k "$KEY" \
-  '{name:$n, create_type:"CERTIFICATE_CREATE_IMPORTED", certificate:$c, privatekey:$k}')" >/dev/null || true
+# The cert and key are handed to middleware over its local socket using the
+# preinstalled Python API client instead of being embedded in a `midclt`
+# command line. A PEM chain plus private key runs to several KB, which can
+# overrun the command-line argument length limit and get the import killed
+# mid-run (see issue #1). It also keeps the private key out of `ps` output.
+#
+# midclt only learned to read a JSON payload from stdin in 2026 (TrueNAS 26.x),
+# so the API client is the portable path for 24.10 through 26.x.
+#
+# stdout carries "<id> <created|reused>" back to the shell; everything human
+# readable goes to stderr, which is already redirected into the log file.
+IMPORT_RESULT="$(
+  TS_CERT_NAME="$CERT_NAME" TS_CRT_FILE="$CRT" TS_KEY_FILE="$KEY" "$PY_BIN" - <<'PY'
+import datetime
+import os
+import sys
 
-CERT_ID="$(midclt call certificate.query | jq -r --arg n "$CERT_NAME" \
-  '.[] | select(.name==$n) | .id' | tail -n 1)"
 
+def log(level, msg):
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    sys.stderr.write("%s [%-5s] %s\n" % (stamp, level, msg))
+
+
+try:
+    from truenas_api_client import Client
+    log("INFO", "using API client: truenas_api_client")
+except ImportError:
+    try:
+        from middlewared.client import Client
+        log("INFO", "using API client: middlewared.client")
+    except ImportError:
+        log("ERROR", "no TrueNAS middleware Python API client found")
+        sys.exit(2)
+
+name = os.environ["TS_CERT_NAME"]
+
+with open(os.environ["TS_CRT_FILE"]) as fh:
+    certificate = fh.read()
+with open(os.environ["TS_KEY_FILE"]) as fh:
+    privatekey = fh.read()
+log("INFO", "read %d bytes of certificate and %d bytes of private key"
+    % (len(certificate), len(privatekey)))
+
+try:
+    log("INFO", "connecting to the middleware socket")
+    with Client() as client:
+        log("INFO", "querying certificate.query for name=%s" % name)
+        existing = client.call("certificate.query", [["name", "=", name]])
+        log("INFO", "certificate.query returned %d match(es)" % len(existing))
+
+        if existing:
+            # An earlier run today already imported under this name; reuse it.
+            cert_id = existing[-1]["id"]
+            log("INFO", "reusing existing certificate id=%s (imported earlier today)"
+                % cert_id)
+            print("%s reused" % cert_id)
+            sys.exit(0)
+
+        # certificate.create is a job; job=True waits for it to finish so the
+        # cert really exists before we point the UI at it.
+        log("INFO", "calling certificate.create (job, create_type="
+            "CERTIFICATE_CREATE_IMPORTED) and waiting for it to finish")
+        created = client.call("certificate.create", {
+            "name": name,
+            "create_type": "CERTIFICATE_CREATE_IMPORTED",
+            "certificate": certificate,
+            "privatekey": privatekey,
+        }, job=True)
+except Exception as exc:
+    log("ERROR", "certificate import failed: %s" % exc)
+    sys.exit(2)
+
+cert_id = created["id"] if isinstance(created, dict) else created
+log("INFO", "certificate.create finished, new certificate id=%s" % cert_id)
+print("%s created" % cert_id)
+PY
+)"
+
+CERT_ID="${IMPORT_RESULT%% *}"
+CERT_STATUS="${IMPORT_RESULT##* }"
 if [[ -z "${CERT_ID:-}" || "$CERT_ID" == "null" ]]; then
-  echo "ERROR: could not find imported certificate by name: $CERT_NAME"
+  err "could not determine certificate ID for: $CERT_NAME"
+  exit 2
+fi
+log "certificate ID $CERT_ID ($CERT_STATUS)"
+
+# ---------- apply to the web UI ----------
+log "--- applying certificate to the web UI ---"
+UI_PAYLOAD="$(jq -n --argjson id "$CERT_ID" '{ui_certificate:$id, ui_restart_delay: 1}' -c)"
+log "system.general.update payload: $UI_PAYLOAD (${#UI_PAYLOAD} bytes)"
+if ui_out="$(midclt call system.general.update "$UI_PAYLOAD" 2>&1)"; then
+  log "system.general.update OK"
+  log_block "$ui_out"
+else
+  err "system.general.update failed (rc=$?)"
+  log_block "$ui_out"
   exit 2
 fi
 
-echo "Using imported CERT_ID: $CERT_ID"
+log "restarting the web UI (system.general.ui_restart)"
+if restart_out="$(midclt call system.general.ui_restart 2>&1)"; then
+  log "ui_restart requested"
+  log_block "$restart_out"
+else
+  err "system.general.ui_restart failed (rc=$?)"
+  log_block "$restart_out"
+  exit 2
+fi
 
-# Apply to Web UI and restart UI
-midclt call system.general.update "$(jq -n --argjson id "$CERT_ID" '{ui_certificate:$id, ui_restart_delay: 1}')"
-midclt call system.general.ui_restart
+# ---------- cleanup ----------
+# Remove old tailscale-ui-* certificates (keep only the one just imported)
+log "--- cleaning up old tailscale-ui-* certificates ---"
+ALL_CERTS="$(midclt call certificate.query)"
+log "certificate store holds $(printf '%s' "$ALL_CERTS" | jq 'length') certificate(s) in total"
+log_block "$(printf '%s' "$ALL_CERTS" | jq -r --argjson keep "$CERT_ID" \
+  '.[] | select(.name | startswith("tailscale-ui-"))
+       | "id=\(.id)  \(.name)\(if .id == $keep then "  <- keeping" else "  <- deleting" end)"')"
 
-# Cleanup: remove old tailscale-ui-* certificates (keep only the one just imported)
-OLD_CERTS="$(midclt call certificate.query | jq -r --argjson keep "$CERT_ID" \
+OLD_CERTS="$(printf '%s' "$ALL_CERTS" | jq -r --argjson keep "$CERT_ID" \
   '[.[] | select(.name | startswith("tailscale-ui-")) | select(.id != $keep) | .id] | .[]')"
 
 if [[ -n "$OLD_CERTS" ]]; then
   for old_id in $OLD_CERTS; do
-    echo "Deleting old certificate ID: $old_id"
-    midclt call certificate.delete "$old_id" || echo "WARN: failed to delete cert $old_id"
+    log "deleting old certificate id=$old_id"
+    if del_out="$(midclt call certificate.delete "$old_id" 2>&1)"; then
+      log "certificate.delete id=$old_id accepted"
+      log_block "$del_out"
+    else
+      warn "failed to delete cert id=$old_id (rc=$?)"
+      log_block "$del_out"
+    fi
   done
 else
-  echo "No old tailscale-ui certificates to clean up"
+  log "no old tailscale-ui certificates to clean up"
 fi
 
-echo "SUCCESS: applied new UI cert (name=$CERT_NAME id=$CERT_ID)"
+log "SUCCESS: web UI cert is name=$CERT_NAME id=$CERT_ID ($CERT_STATUS), expires $(command -v openssl >/dev/null 2>&1 && openssl x509 -in "$CRT" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || echo unknown)"
