@@ -40,6 +40,25 @@ command -v docker >/dev/null || { echo "ERROR: docker not found (PATH=$PATH)"; e
 command -v jq >/dev/null || { echo "ERROR: jq not found (PATH=$PATH)"; exit 2; }
 command -v midclt >/dev/null || { echo "ERROR: midclt not found (PATH=$PATH)"; exit 2; }
 
+# Pick a python3 that can import the TrueNAS API client. The client ships
+# preinstalled on TrueNAS and provides midclt itself, so midclt's own
+# interpreter is the fallback if the default python3 cannot import it.
+PY_BIN=""
+for candidate in python3 "$(sed -n '1s|^#!\([^ ]*\).*|\1|p' "$(command -v midclt)" 2>/dev/null)"; do
+  [[ -n "$candidate" ]] || continue
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if "$candidate" -c 'import truenas_api_client' 2>/dev/null \
+    || "$candidate" -c 'import middlewared.client' 2>/dev/null; then
+    PY_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$PY_BIN" ]]; then
+  echo "ERROR: no python3 found that can import the TrueNAS API client"
+  echo "       (tried 'truenas_api_client' and 'middlewared.client')"
+  exit 2
+fi
+
 # Ensure container is running
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   echo "ERROR: container '$CONTAINER_NAME' is not running"
@@ -73,18 +92,63 @@ fi
 CERT_NAME="tailscale-ui-$(date +%F)"
 echo "Importing certificate as: $CERT_NAME"
 
-# Import into TrueNAS cert store
-midclt call certificate.create "$(jq -n \
-  --arg n "$CERT_NAME" \
-  --rawfile c "$CRT" \
-  --rawfile k "$KEY" \
-  '{name:$n, create_type:"CERTIFICATE_CREATE_IMPORTED", certificate:$c, privatekey:$k}')" >/dev/null || true
+# Import into TrueNAS cert store.
+#
+# The cert and key are handed to middleware over its local socket using the
+# preinstalled Python API client instead of being embedded in a `midclt`
+# command line. A PEM chain plus private key runs to several KB, which can
+# overrun the command-line argument length limit and get the import killed
+# mid-run (see issue #1). It also keeps the private key out of `ps` output.
+#
+# midclt only learned to read a JSON payload from stdin in 2026 (TrueNAS 26.x),
+# so the API client is the portable path for 24.10 through 26.x.
+CERT_ID="$(
+  TS_CERT_NAME="$CERT_NAME" TS_CRT_FILE="$CRT" TS_KEY_FILE="$KEY" "$PY_BIN" - <<'PY'
+import os
+import sys
 
-CERT_ID="$(midclt call certificate.query | jq -r --arg n "$CERT_NAME" \
-  '.[] | select(.name==$n) | .id' | tail -n 1)"
+try:
+    from truenas_api_client import Client
+except ImportError:
+    try:
+        from middlewared.client import Client
+    except ImportError:
+        print("ERROR: no TrueNAS middleware Python API client found", file=sys.stderr)
+        sys.exit(2)
+
+name = os.environ["TS_CERT_NAME"]
+
+with open(os.environ["TS_CRT_FILE"]) as fh:
+    certificate = fh.read()
+with open(os.environ["TS_KEY_FILE"]) as fh:
+    privatekey = fh.read()
+
+try:
+    with Client() as client:
+        existing = client.call("certificate.query", [["name", "=", name]])
+        if existing:
+            # An earlier run today already imported under this name; reuse it.
+            print(existing[-1]["id"])
+            sys.exit(0)
+
+        # certificate.create is a job; job=True waits for it to finish so the
+        # cert really exists before we point the UI at it.
+        created = client.call("certificate.create", {
+            "name": name,
+            "create_type": "CERTIFICATE_CREATE_IMPORTED",
+            "certificate": certificate,
+            "privatekey": privatekey,
+        }, job=True)
+except Exception as exc:
+    print("ERROR: certificate import failed: %s" % exc, file=sys.stderr)
+    sys.exit(2)
+
+print(created["id"] if isinstance(created, dict) else created)
+PY
+)"
 
 if [[ -z "${CERT_ID:-}" || "$CERT_ID" == "null" ]]; then
-  echo "ERROR: could not find imported certificate by name: $CERT_NAME"
+  echo "ERROR: could not determine certificate ID for: $CERT_NAME"
   exit 2
 fi
 
